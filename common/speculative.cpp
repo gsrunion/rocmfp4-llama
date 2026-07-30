@@ -2363,3 +2363,143 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 str_perf.c_str());
     }
 }
+
+//
+// embedded DFlash draft extraction (single-file "baked draft" ggufs)
+//
+
+#include "gguf.h"
+#include <sys/stat.h>
+#include <cinttypes>
+
+static void dflash_copy_kv(gguf_context * dst, const gguf_context * src,
+                           int64_t kid, const char * out_key) {
+    const auto type = gguf_get_kv_type(src, kid);
+    switch (type) {
+        case GGUF_TYPE_UINT8:   gguf_set_val_u8  (dst, out_key, gguf_get_val_u8  (src, kid)); break;
+        case GGUF_TYPE_INT8:    gguf_set_val_i8  (dst, out_key, gguf_get_val_i8  (src, kid)); break;
+        case GGUF_TYPE_UINT16:  gguf_set_val_u16 (dst, out_key, gguf_get_val_u16 (src, kid)); break;
+        case GGUF_TYPE_INT16:   gguf_set_val_i16 (dst, out_key, gguf_get_val_i16 (src, kid)); break;
+        case GGUF_TYPE_UINT32:  gguf_set_val_u32 (dst, out_key, gguf_get_val_u32 (src, kid)); break;
+        case GGUF_TYPE_INT32:   gguf_set_val_i32 (dst, out_key, gguf_get_val_i32 (src, kid)); break;
+        case GGUF_TYPE_FLOAT32: gguf_set_val_f32 (dst, out_key, gguf_get_val_f32 (src, kid)); break;
+        case GGUF_TYPE_UINT64:  gguf_set_val_u64 (dst, out_key, gguf_get_val_u64 (src, kid)); break;
+        case GGUF_TYPE_INT64:   gguf_set_val_i64 (dst, out_key, gguf_get_val_i64 (src, kid)); break;
+        case GGUF_TYPE_FLOAT64: gguf_set_val_f64 (dst, out_key, gguf_get_val_f64 (src, kid)); break;
+        case GGUF_TYPE_BOOL:    gguf_set_val_bool(dst, out_key, gguf_get_val_bool(src, kid)); break;
+        case GGUF_TYPE_STRING:  gguf_set_val_str (dst, out_key, gguf_get_val_str (src, kid)); break;
+        case GGUF_TYPE_ARRAY: {
+            const auto atype = gguf_get_arr_type(src, kid);
+            const size_t n = gguf_get_arr_n(src, kid);
+            if (atype == GGUF_TYPE_STRING) {
+                std::vector<const char *> strs(n);
+                for (size_t i = 0; i < n; ++i) {
+                    strs[i] = gguf_get_arr_str(src, kid, i);
+                }
+                gguf_set_arr_str(dst, out_key, strs.data(), n);
+            } else {
+                gguf_set_arr_data(dst, out_key, atype, gguf_get_arr_data(src, kid), n);
+            }
+            break;
+        }
+        default: break;
+    }
+}
+
+bool common_dflash_extract_embedded(const std::string & model_path, const std::string & cache_path) {
+    // cheap detection: metadata-only parse
+    ggml_context * meta_ctx = nullptr;
+    gguf_init_params ip = { /*.no_alloc =*/ true, /*.ctx =*/ &meta_ctx };
+    gguf_context * in = gguf_init_from_file(model_path.c_str(), ip);
+    if (!in) {
+        return false;
+    }
+    const int64_t marker = gguf_find_key(in, "dflash.embedded");
+    if (marker < 0 || !gguf_get_val_bool(in, marker)) {
+        gguf_free(in);
+        if (meta_ctx) ggml_free(meta_ctx);
+        return false;
+    }
+
+    struct stat st;
+    if (stat(cache_path.c_str(), &st) == 0 && st.st_size > 0) {
+        gguf_free(in);
+        if (meta_ctx) ggml_free(meta_ctx);
+        return true; // already extracted
+    }
+
+    LOG_INF("%s: extracting embedded DFlash draft from %s\n", __func__, model_path.c_str());
+
+    gguf_context * out = gguf_init_empty();
+    gguf_set_val_str(out, "general.architecture", "dflash");
+    gguf_set_val_str(out, "general.name", "embedded-dflash-draft");
+
+    const int64_t n_kv = gguf_get_n_kv(in);
+    for (int64_t i = 0; i < n_kv; ++i) {
+        const char * key = gguf_get_key(in, i);
+        if (strncmp(key, "dflash.", 7) == 0 && strcmp(key, "dflash.embedded") != 0) {
+            dflash_copy_kv(out, in, i, key);              // draft arch keys, verbatim
+        } else if (strncmp(key, "tokenizer.", 10) == 0) {
+            dflash_copy_kv(out, in, i, key);              // shared tokenizer
+        }
+    }
+
+    // pull the prefixed tensors' bytes straight out of the combined file
+    FILE * f = fopen(model_path.c_str(), "rb");
+    if (!f) {
+        gguf_free(in); gguf_free(out);
+        if (meta_ctx) ggml_free(meta_ctx);
+        return false;
+    }
+    const size_t data_base = gguf_get_data_offset(in);
+
+    ggml_init_params gp = { /*.mem_size =*/ ggml_tensor_overhead() * 512,
+                            /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context * tctx = ggml_init(gp);
+    std::vector<void *> bufs;
+
+    const int64_t n_tensors = gguf_get_n_tensors(in);
+    int n_extracted = 0;
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(in, i);
+        if (strncmp(name, "dflash.", 7) != 0) {
+            continue;
+        }
+        ggml_tensor * meta = ggml_get_tensor(meta_ctx, name);
+        if (!meta) {
+            continue;
+        }
+        ggml_tensor * t = ggml_new_tensor(tctx, meta->type, ggml_n_dims(meta), meta->ne);
+        ggml_set_name(t, name + 7); // strip prefix
+        const size_t sz = gguf_get_tensor_size(in, i);
+        void * buf = malloc(sz);
+        bufs.push_back(buf);
+        t->data = buf;
+        if (fseek(f, (long) (data_base + gguf_get_tensor_offset(in, i)), SEEK_SET) != 0 ||
+            fread(buf, 1, sz, f) != sz) {
+            LOG_ERR("%s: short read extracting '%s'\n", __func__, name);
+            fclose(f);
+            for (auto * b : bufs) free(b);
+            ggml_free(tctx); gguf_free(in); gguf_free(out);
+            if (meta_ctx) ggml_free(meta_ctx);
+            return false;
+        }
+        gguf_add_tensor(out, t);
+        n_extracted++;
+    }
+    fclose(f);
+
+    const std::string tmp_path = cache_path + ".tmp";
+    const bool ok = n_extracted > 0 && gguf_write_to_file(out, tmp_path.c_str(), /*only_meta=*/ false);
+    if (ok) {
+        rename(tmp_path.c_str(), cache_path.c_str());
+        LOG_INF("%s: wrote %d draft tensors -> %s\n", __func__, n_extracted, cache_path.c_str());
+    }
+
+    for (auto * b : bufs) free(b);
+    ggml_free(tctx);
+    if (meta_ctx) ggml_free(meta_ctx);
+    gguf_free(in);
+    gguf_free(out);
+    return ok;
+}

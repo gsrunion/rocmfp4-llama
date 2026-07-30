@@ -756,6 +756,22 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
+        // Embedded DFlash draft: a gguf carrying 'dflash.embedded' + prefixed
+        // draft tensors is self-accelerating — extract the draft beside the
+        // model (once, cached) and enable draft-dflash automatically.
+        if (!params_base.speculative.has_dft()) {
+            const std::string cache_path = params_base.model.path + ".embedded-draft.gguf";
+            if (common_dflash_extract_embedded(params_base.model.path, cache_path)) {
+                SRV_INF("embedded DFlash draft detected -> %s\n", cache_path.c_str());
+                params_base.speculative.draft.mparams.path = cache_path;
+                auto & types = params_base.speculative.types;
+                if (std::find(types.begin(), types.end(),
+                              COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) == types.end()) {
+                    types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+                }
+            }
+        }
+
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
