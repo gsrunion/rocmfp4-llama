@@ -51,6 +51,12 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, 0);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
 
+        // optional attention bias (attention_bias: true drafts)
+        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), { n_embd_head_k * n_head }, TENSOR_NOT_REQUIRED);
+        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), { n_embd_k_gqa }, TENSOR_NOT_REQUIRED);
+        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), { n_embd_v_gqa }, TENSOR_NOT_REQUIRED);
+        layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), { n_embd }, TENSOR_NOT_REQUIRED);
+
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
 
@@ -147,6 +153,13 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g);
             ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g);
 
+            if (layer.wk_b) {
+                Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
+            }
+            if (layer.wv_b) {
+                Vcur = ggml_add(ctx0, Vcur, layer.wv_b);
+            }
+
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
@@ -221,13 +234,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * noise_norm = build_norm(inpL, layer.attn_norm, NULL, LLM_NORM_RMS, il);
         cb(noise_norm, "noise_norm", il);
 
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, noise_norm);
-        ggml_tensor * Kcur = build_lora_mm(layer.wk, noise_norm);
-        ggml_tensor * Vcur = build_lora_mm(layer.wv, noise_norm);
-
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
-        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        auto [Qcur, Kcur, Vcur] = build_qkv(layer, noise_norm, n_embd_head, n_head, n_head_kv, il);
 
         Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
         Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
@@ -248,8 +255,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         // cache-aware, non-causal attention
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, layer.wo, layer.wo_b, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      layer.wo, layer.wo_b, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);
