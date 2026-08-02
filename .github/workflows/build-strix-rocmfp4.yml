@@ -71,15 +71,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rocm-hip-sdk
 
-      # Flags mirror scripts/build-strix-rocmfp4-mtp.sh, plus:
-      #  - RPATH=$ORIGIN so the packaged binaries find the bundled .so files
-      #  - NATIVE=OFF because a CI runner is not the target CPU. That alone
-      #    builds a baseline CPU backend with no AVX512, which measured ~21%
-      #    slower than the on-box build (70.8 vs 89.4 tok/s) - this model is an
-      #    SSM/MoE hybrid, so ops without a GPU kernel land on the CPU.
-      #    BACKEND_DL + CPU_ALL_VARIANTS restore that: they build every CPU
-      #    variant and pick one at runtime. CPU_ALL_VARIANTS requires
-      #    BACKEND_DL, so the two must be set together.
+      # Flags mirror scripts/build-strix-rocmfp4-mtp.sh, plus RPATH=$ORIGIN so
+      # the packaged binaries find the bundled .so files, and NATIVE=OFF
+      # because a CI runner is not the target CPU (CPU_ALL_VARIANTS then builds
+      # every variant and dispatches at runtime; it requires BACKEND_DL).
+      #
+      # OPEN ISSUE: binaries from this workflow decode ~14-20% slower than the
+      # on-box build (71.2 vs 83.2 tok/s, same model/flags/harness). The CPU
+      # backend was ruled OUT as the cause: CPU_ALL_VARIANTS demonstrably
+      # landed (13 libggml-cpu-*.so shipped, AVX512 present in system_info) and
+      # throughput moved only +0.4 tok/s. Bumping ROCm 7.2.1 -> 7.2.4 to match
+      # the containers did not help either. Note the CI and on-box builds also
+      # differ in DRAFT ACCEPTANCE on identical input (94.3% vs 96.1%), which
+      # points at a numerical/kernel difference rather than CPU tuning.
+      # Untested lead: the on-box build is a true -march=native Zen5 compile.
       - name: Build
         run: |
           cmake -S . -B build-strix-rocmfp4 \
