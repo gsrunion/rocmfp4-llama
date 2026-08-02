@@ -70,3 +70,8 @@ struct common_speculative_deleter {
 };
 
 typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
+
+// embedded DFlash draft: if model_path carries 'dflash.embedded', extract the
+// prefixed draft tensors into cache_path (no-op if cached). Returns true when
+// an embedded draft is present and cache_path is ready to use.
+bool common_dflash_extract_embedded(const std::string & model_path, const std::string & cache_path);

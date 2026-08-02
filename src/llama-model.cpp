@@ -1409,7 +1409,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.done_getting_tensors();
+    // combined-file "baked draft" ggufs carry extra sibling-model tensors
+    // (see done_getting_tensors' partial path) — this arch's builder never
+    // claims them, so relax the count check only when the file says so.
+    ml.done_getting_tensors(gguf_find_key(ml.metadata, "dflash.embedded") >= 0);
 
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
