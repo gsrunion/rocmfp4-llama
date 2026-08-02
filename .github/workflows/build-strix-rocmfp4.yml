@@ -1,0 +1,151 @@
+name: Build Strix ROCmFP4 binaries
+
+# Produces a downloadable llama.cpp build for AMD Strix Halo (gfx1151) with the
+# ROCmFP4 + DFlash changes in this fork. Runs on a stock GitHub runner - the
+# ROCm toolchain is installed from repo.radeon.com, so no self-hosted GPU box
+# is needed to build (a gfx1151 GPU is only needed to *run* the result).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish a GitHub Release (otherwise upload a build artifact only)"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+env:
+  ROCM_VERSION: "7.2.1"
+  GPU_TARGETS: "gfx1151"
+
+jobs:
+  ubuntu-22-strix-rocmfp4:
+    runs-on: ubuntu-22.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Free up disk space
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: strix-rocmfp4-${{ env.ROCM_VERSION }}
+
+      # glslc / vulkan headers are needed because this fork builds the Vulkan
+      # backend alongside HIP (see scripts/build-strix-rocmfp4-mtp.sh)
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake git wget \
+            glslc libgomp1 libssl-dev libvulkan-dev spirv-headers
+
+      - name: Setup ROCm
+        run: |
+          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+          wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
+            gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+
+          sudo tee /etc/apt/sources.list.d/rocm.list << EOF
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${{ env.ROCM_VERSION }} jammy main
+          EOF
+
+          sudo tee /etc/apt/preferences.d/rocm-pin-600 << EOF
+          Package: *
+          Pin: release o=repo.radeon.com
+          Pin-Priority: 600
+          EOF
+
+          sudo apt-get update
+          sudo apt-get install -y rocm-hip-sdk
+
+      # Flags mirror scripts/build-strix-rocmfp4-mtp.sh. The two RPATH settings
+      # are the only addition: they let the packaged binaries find the bundled
+      # .so files without LD_LIBRARY_PATH.
+      - name: Build
+        run: |
+          cmake -S . -B build-strix-rocmfp4 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+            -DGGML_HIP=ON \
+            -DHIP_PLATFORM=amd \
+            -DGGML_HIP_ROCWMMA_FATTN=OFF \
+            -DGGML_HIP_FORCE_MMQ=ON \
+            -DGGML_VULKAN=ON \
+            -DGGML_CUDA=OFF \
+            -DGGML_NATIVE=OFF \
+            -DCMAKE_HIP_ARCHITECTURES="${{ env.GPU_TARGETS }}" \
+            -DGPU_TARGETS="${{ env.GPU_TARGETS }}" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_WEBUI=OFF \
+            -DLLAMA_USE_PREBUILT_WEBUI=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DGGML_BUILD_TESTS=OFF
+
+          cmake --build build-strix-rocmfp4 -j $(nproc) --target \
+            llama-cli \
+            llama-server \
+            llama-completion \
+            llama-quantize \
+            llama-bench
+
+      - name: Pack artifacts
+        id: pack
+        run: |
+          NAME="llama-rocmfp4-strix-gfx1151-rocm${{ env.ROCM_VERSION }}-${GITHUB_SHA::7}"
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+
+          mkdir -p dist
+          cp build-strix-rocmfp4/bin/llama-* dist/
+          find build-strix-rocmfp4 -name "*.so*" -exec cp -P {} dist/ \;
+          cp LICENSE dist/
+
+          # record exactly what produced this build
+          cat > dist/BUILD-INFO.txt << EOF
+          llama.cpp fork : ${{ github.repository }}
+          commit         : ${{ github.sha }}
+          ref            : ${{ github.ref }}
+          run            : ${{ github.run_id }}
+          ROCm           : ${{ env.ROCM_VERSION }}
+          GPU targets    : ${{ env.GPU_TARGETS }} (AMD Strix Halo)
+
+          Requires a ROCm ${{ env.ROCM_VERSION }} runtime on the host.
+          Run from this directory, e.g:  ./llama-server -m model.gguf -ngl 99
+          EOF
+
+          tar -czvf "$NAME.tar.gz" --transform "s,^\.,$NAME," -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: ${{ steps.pack.outputs.name }}.tar.gz
+
+      - name: Publish release
+        if: inputs.release || startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }}"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Strix Halo ROCmFP4 build ($TAG)" \
+            --notes "llama.cpp fork build for AMD Strix Halo (gfx1151), ROCm ${{ env.ROCM_VERSION }}. Built from ${{ github.sha }}. Requires a matching ROCm runtime on the host." \
+            --latest=false \
+            || echo "release $TAG already exists, uploading asset to it"
+          gh release upload "$TAG" "${{ steps.pack.outputs.name }}.tar.gz" \
+            --repo "${{ github.repository }}" --clobber
