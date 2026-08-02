@@ -22,7 +22,7 @@ env:
 
 jobs:
   ubuntu-22-strix-rocmfp4:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     permissions:
       contents: write
@@ -59,7 +59,7 @@ jobs:
             gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
 
           sudo tee /etc/apt/sources.list.d/rocm.list << EOF
-          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${{ env.ROCM_VERSION }} jammy main
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${{ env.ROCM_VERSION }} noble main
           EOF
 
           sudo tee /etc/apt/preferences.d/rocm-pin-600 << EOF
